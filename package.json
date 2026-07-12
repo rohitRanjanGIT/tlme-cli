@@ -1,0 +1,28 @@
+{
+  "name": "tlme",
+  "version": "1.0.0",
+  "description": "Ask AI questions straight from your terminal — multi-provider (Claude, OpenAI, Grok, Google AI Studio, OpenRouter), zero dependencies, streamed answers.",
+  "type": "module",
+  "bin": {
+    "tlme": "./index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "keywords": [
+    "cli",
+    "ai",
+    "assistant",
+    "terminal",
+    "claude",
+    "openai",
+    "grok",
+    "gemini",
+    "openrouter"
+  ],
+  "license": "MIT"
+}
