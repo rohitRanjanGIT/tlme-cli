@@ -1,5 +1,5 @@
 {
-  "name": "tlme",
+  "name": "tlme-cli",
   "version": "1.0.0",
   "description": "Ask AI questions straight from your terminal — multi-provider (Claude, OpenAI, Grok, Google AI Studio, OpenRouter), zero dependencies, streamed answers.",
   "type": "module",
@@ -13,6 +13,14 @@
     "index.js",
     "README.md"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rohitRanjanGIT/tlme-cli.git"
+  },
+  "homepage": "https://github.com/rohitRanjanGIT/tlme-cli#readme",
+  "bugs": {
+    "url": "https://github.com/rohitRanjanGIT/tlme-cli/issues"
+  },
   "keywords": [
     "cli",
     "ai",

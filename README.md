@@ -18,12 +18,12 @@ The dot creates the app in your current directory instead of a new subfolder.
 Requires **Node.js >= 18**.
 
 ```bash
-cd tlme
-npm link          # or: npm install -g .
+npm install -g tlme-cli
 ```
 
-This exposes a global `tlme` command. To develop without linking, run
-`node index.js <question...>` from the project directory.
+This exposes a global `tlme` command. To hack on it locally instead, clone the
+repo and run `npm link` (or just `node index.js <question...>`) from the project
+directory.
 
 ## Quick start
 
