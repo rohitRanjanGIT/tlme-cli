@@ -18,6 +18,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import readline from "node:readline";
+import { pathToFileURL } from "node:url";
 
 // ---------------------------------------------------------------------------
 // 1. Provider registry
@@ -55,6 +56,8 @@ function openAICompatible({ url, defaultModel, keyHint, extraHeaders = {} }) {
     extractDelta: (o) => o?.choices?.[0]?.delta?.content || "",
     // returns an error message string if the event is an error, else null
     extractError: (o) => o?.error?.message || null,
+    // returns a finish reason string when the turn ends, else null
+    extractFinish: (o) => o?.choices?.[0]?.finish_reason || null,
     // GET request for listing the models available to this key
     modelsRequest: (apiKey) => ({
       url: url.replace(/\/chat\/completions$/, "/models"),
@@ -92,6 +95,7 @@ const PROVIDERS = {
         ? o.delta.text
         : "",
     extractError: (o) => (o?.type === "error" ? o?.error?.message || "unknown error" : null),
+    extractFinish: (o) => (o?.type === "message_delta" ? o?.delta?.stop_reason || null : null),
     modelsRequest: (apiKey) => ({
       url: "https://api.anthropic.com/v1/models?limit=1000",
       headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
@@ -155,11 +159,15 @@ const PROVIDERS = {
         },
       };
     },
+    // Skip "thought" parts — thinking models (e.g. Gemma) stream their raw
+    // reasoning tagged thought:true; only the plain parts are the answer.
     extractDelta: (o) =>
       (o?.candidates?.[0]?.content?.parts || [])
+        .filter((p) => !p.thought)
         .map((p) => p?.text || "")
         .join(""),
     extractError: (o) => o?.error?.message || null,
+    extractFinish: (o) => o?.candidates?.[0]?.finishReason || null,
     modelsRequest: (apiKey) => ({
       url:
         "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000&key=" +
@@ -279,6 +287,39 @@ function maskKey(key) {
   return `${key.slice(0, 10)}...${key.slice(-4)}`;
 }
 
+// --- Rich TUI palette (256-color) for the setup panels ---------------------
+const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
+const visLen = (s) => stripAnsi(s).length;
+const REV = (s) => (useColor ? `\x1b[7m${s}\x1b[0m` : s); // cursor block
+const fg256 = (n) => (s) => (useColor ? `\x1b[38;5;${n}m${s}\x1b[0m` : s);
+const section = (s) => (useColor ? `\x1b[1;38;5;140m${s}\x1b[0m` : s); // purple header
+const desc = fg256(244); // dim gray descriptions
+const hintc = fg256(244); // footer hints
+const check = fg256(114); // green ✓
+// Selected row: peach background, near-black text; plain ">" prefix without color.
+const selBar = (s) => (useColor ? `\x1b[48;5;216m\x1b[38;5;16m${s}\x1b[0m` : `>${s}`);
+
+// Alternate-screen control so the panels render like a modal and leave the
+// scrollback clean on exit.
+const ALT = { enter: "\x1b[?1049h", exit: "\x1b[?1049l", hide: "\x1b[?25l", show: "\x1b[?25h" };
+let _altActive = false;
+function enterAlt() {
+  process.stdout.write(ALT.enter + ALT.hide);
+  _altActive = true;
+}
+function exitAlt() {
+  if (_altActive) {
+    process.stdout.write(ALT.show + ALT.exit);
+    _altActive = false;
+  }
+}
+function panelWidth() {
+  return Math.min(process.stdout.columns || 80, 88);
+}
+function panelRows() {
+  return Math.max(6, (process.stdout.rows || 24) - 8);
+}
+
 // ---------------------------------------------------------------------------
 // 4b. Interactive prompts (native readline — no dependencies)
 // ---------------------------------------------------------------------------
@@ -390,153 +431,226 @@ function printableOf(str) {
   return [...str].filter((c) => c >= " " && c !== "\x7f").join("");
 }
 
-// Arrow-key list picker with a scrollable viewport and type-to-filter.
-// Resolves to the index (into `items`) that was chosen. Ctrl-C cancels.
-function selectList({ title, items, current = 0, pageSize = 10, filter = false }) {
+// Render one panel frame: home the cursor, write each line clearing to EOL,
+// then clear anything below. Called on every keypress.
+function paintPanel(lines) {
+  let out = "\x1b[H";
+  for (const ln of lines) out += ln + "\x1b[K\n";
+  out += "\x1b[0J";
+  process.stdout.write(out);
+}
+
+// The title bar: bold title on the left, "esc" affordance on the right.
+function panelTitleLine(title, cols) {
+  const pad = Math.max(1, cols - 4 - title.length - 3 - 3);
+  return "    " + bold(title) + " ".repeat(pad) + dim("esc");
+}
+
+// The search input line: placeholder (dim, with a cursor block on the first
+// char) when empty, otherwise the typed query followed by a cursor block.
+function panelSearchLine(query, placeholder) {
+  if (!query) return "    " + REV(placeholder[0]) + desc(placeholder.slice(1));
+  return "    " + query + REV(" ");
+}
+
+// OpenCode-style modal picker. `groups` is [{ name, items: [{label, desc,
+// value, current}] }]. Renders section headers, a search/filter box and a
+// full-width highlight on the selected row. Resolves the chosen item's `value`,
+// or null on Escape. Ctrl-C hard-cancels (exit 130).
+function panelSelect({ title, placeholder = "Search", groups, current = 0, footer }) {
   return new Promise((resolve, reject) => {
     const stdin = process.stdin;
-    let query = "";
-    let index = Math.max(0, Math.min(current, items.length - 1));
-    let view = items.map((label, i) => ({ label, i })); // filtered view
-    let rendered = 0;
 
-    const applyFilter = () => {
+    // Flatten items (keeping group tags) for navigation + filtering.
+    const flat = [];
+    for (const g of groups) for (const it of g.items) flat.push({ ...it, _group: g.name });
+    let query = "";
+    let items = flat;
+    let index = Math.max(0, Math.min(current, items.length - 1));
+
+    const refilter = () => {
       const q = query.toLowerCase();
-      view = items
-        .map((label, i) => ({ label, i }))
-        .filter((o) => o.label.toLowerCase().includes(q));
-      index = Math.max(0, Math.min(index, view.length - 1));
+      items = flat.filter((it) => `${it.label} ${it.desc || ""}`.toLowerCase().includes(q));
+      if (index >= items.length) index = items.length - 1;
+      if (index < 0) index = 0;
     };
 
     const draw = () => {
-      if (rendered > 0) process.stdout.write(`\x1b[${rendered}A`); // up to top
-      process.stdout.write("\x1b[0J"); // clear from cursor down
+      // Read size on every draw so the panel reflows when the window resizes.
+      const cols = panelWidth();
+      const barW = cols - 2;
+      const rows = panelRows();
 
-      const lines = [];
-      if (filter) lines.push(`${dim("filter:")} ${query}${useColor ? "\x1b[7m \x1b[0m" : "_"}`);
-
-      const total = view.length;
-      if (total === 0) {
-        lines.push(dim("  (no matches)"));
-      } else {
-        let start = Math.max(0, Math.min(index - Math.floor(pageSize / 2), total - pageSize));
-        const end = Math.min(total, start + pageSize);
-        if (start > 0) lines.push(dim(`  ↑ ${start} more`));
-        for (let r = start; r < end; r++) {
-          const sel = r === index;
-          lines.push(sel ? cyan(`❯ ${view[r].label}`) : `  ${view[r].label}`);
+      // Build the display list (section headers interleaved with items).
+      const disp = [];
+      let g = null;
+      items.forEach((it, i) => {
+        if (it._group !== g) {
+          disp.push({ kind: "section", label: it._group });
+          g = it._group;
         }
-        if (end < total) lines.push(dim(`  ↓ ${total - end} more`));
-      }
-      const hint = filter
-        ? "↑/↓ move · type to filter · Enter select · Ctrl+C cancel"
-        : "↑/↓ move · Enter select · Ctrl+C cancel";
-      lines.push(dim(hint));
+        disp.push({ kind: "item", it, i });
+      });
 
-      process.stdout.write(lines.join("\n") + "\n");
-      rendered = lines.length;
+      // Viewport: window `disp` around the selected item when it overflows.
+      let selDisp = disp.findIndex((d) => d.kind === "item" && d.i === index);
+      if (selDisp < 0) selDisp = 0;
+      let start = 0;
+      if (disp.length > rows) {
+        start = Math.max(0, Math.min(selDisp - Math.floor(rows / 2), disp.length - rows));
+      }
+      const end = Math.min(disp.length, start + rows);
+
+      const lines = [panelTitleLine(title, cols), "", panelSearchLine(query, placeholder), ""];
+      if (items.length === 0) {
+        lines.push("    " + desc("No matches"));
+      } else {
+        if (start > 0) lines.push("    " + desc(`↑ ${start} more`));
+        for (let r = start; r < end; r++) {
+          const d = disp[r];
+          if (d.kind === "section") {
+            lines.push("    " + section(d.label));
+            continue;
+          }
+          const it = d.it;
+          const mark = it.current ? "✓" : " ";
+          if (d.i === index) {
+            let bar = ` ${mark} ${it.label}${it.desc ? "  " + it.desc : ""}`;
+            bar = bar.slice(0, barW).padEnd(barW);
+            lines.push(" " + selBar(bar));
+          } else {
+            const m = it.current ? check("✓") : " ";
+            lines.push(`  ${m} ${it.label}${it.desc ? "  " + desc(it.desc) : ""}`);
+          }
+        }
+        if (end < disp.length) lines.push("    " + desc(`↓ ${disp.length - end} more`));
+      }
+      lines.push("");
+      lines.push("    " + hintc(footer || "↑/↓ navigate   enter select   esc cancel   type to filter"));
+      paintPanel(lines);
     };
 
+    const onResize = () => draw();
     const cleanup = () => {
       stdin.removeListener("keypress", onKey);
+      process.stdout.removeListener("resize", onResize);
       if (stdin.isTTY) stdin.setRawMode(false);
       stdin.pause();
+      exitAlt();
     };
 
     const onKey = (str, key) => {
       if (!key) return;
       if (key.ctrl && key.name === "c") {
         cleanup();
-        process.stdout.write("\n");
         process.exitCode = 130;
         reject(new ExitSignal("cancelled"));
         return;
       }
-      if (key.name === "return" || key.name === "enter") {
-        if (view.length === 0) return;
+      if (key.name === "escape") {
         cleanup();
-        resolve(view[index].i);
+        resolve(null);
         return;
       }
-      if (key.name === "up") index = Math.max(0, index - 1);
-      else if (key.name === "down") index = Math.min(view.length - 1, index + 1);
-      else if (key.name === "pageup") index = Math.max(0, index - pageSize);
-      else if (key.name === "pagedown") index = Math.min(view.length - 1, index + pageSize);
+      if (key.name === "return" || key.name === "enter") {
+        if (!items.length) return;
+        cleanup();
+        resolve(items[index].value);
+        return;
+      }
+      if (!items.length && key.name !== "backspace" && !printableOf(str)) return;
+      const step = panelRows();
+      if (key.name === "up") index = index > 0 ? index - 1 : items.length - 1;
+      else if (key.name === "down") index = index < items.length - 1 ? index + 1 : 0;
+      else if (key.name === "pageup") index = Math.max(0, index - step);
+      else if (key.name === "pagedown") index = Math.min(items.length - 1, index + step);
       else if (key.name === "home") index = 0;
-      else if (key.name === "end") index = view.length - 1;
-      else if (filter && key.name === "backspace") {
+      else if (key.name === "end") index = items.length - 1;
+      else if (key.name === "backspace") {
+        if (!query) return;
         query = query.slice(0, -1);
-        applyFilter();
-      } else if (filter && key.name === "escape") {
-        query = "";
-        applyFilter();
-      } else if (filter) {
+        refilter();
+      } else {
         const add = printableOf(str);
         if (!add) return;
         query += add;
         index = 0;
-        applyFilter();
-      } else {
-        return; // no filter: ignore other keys, don't redraw
+        refilter();
       }
       draw();
     };
 
-    if (title) process.stdout.write(title + "\n");
+    enterAlt();
     readline.emitKeypressEvents(stdin);
     if (stdin.isTTY) stdin.setRawMode(true);
     stdin.resume();
     stdin.on("keypress", onKey);
+    process.stdout.on("resize", onResize);
     draw();
   });
 }
 
-// Masked secret entry in raw mode (shows * per character). Ctrl-C cancels.
-function askHiddenRaw(query) {
+// OpenCode-style single-field input panel (used for the API key). Masks input
+// with • by default. Resolves the trimmed value, or null on Escape.
+function panelInput({ title, placeholder = "Value", mask = true, footer = "enter submit   esc cancel" }) {
   return new Promise((resolve, reject) => {
     const stdin = process.stdin;
     let value = "";
-    process.stdout.write(query);
 
+    const draw = () => {
+      const cols = panelWidth(); // re-read so the title bar reflows on resize
+      let inputLine;
+      if (!value) inputLine = "    " + REV(placeholder[0]) + desc(placeholder.slice(1));
+      else inputLine = "    " + (mask ? "•".repeat(value.length) : value) + REV(" ");
+      paintPanel([panelTitleLine(title, cols), "", inputLine, "", "", "    " + hintc(footer)]);
+    };
+
+    const onResize = () => draw();
     const cleanup = () => {
       stdin.removeListener("keypress", onKey);
+      process.stdout.removeListener("resize", onResize);
       if (stdin.isTTY) stdin.setRawMode(false);
       stdin.pause();
+      exitAlt();
     };
 
     const onKey = (str, key) => {
       if (!key) return;
       if (key.ctrl && key.name === "c") {
         cleanup();
-        process.stdout.write("\n");
         process.exitCode = 130;
         reject(new ExitSignal("cancelled"));
         return;
       }
+      if (key.name === "escape") {
+        cleanup();
+        resolve(null);
+        return;
+      }
       if (key.name === "return" || key.name === "enter") {
         cleanup();
-        process.stdout.write("\n");
         resolve(value.trim());
         return;
       }
       if (key.name === "backspace") {
-        if (value.length) {
-          value = value.slice(0, -1);
-          process.stdout.write("\b \b");
-        }
+        value = value.slice(0, -1);
+        draw();
         return;
       }
       const add = printableOf(str);
       if (add) {
         value += add;
-        process.stdout.write("*".repeat(add.length));
+        draw();
       }
     };
 
+    enterAlt();
     readline.emitKeypressEvents(stdin);
     if (stdin.isTTY) stdin.setRawMode(true);
     stdin.resume();
     stdin.on("keypress", onKey);
+    process.stdout.on("resize", onResize);
+    draw();
   });
 }
 
@@ -562,7 +676,7 @@ async function fetchModels(providerId, key) {
     }
     let msg = `API error (${res.status}) from ${provider.label}: ${detail}`;
     if (res.status === 401 || res.status === 403) {
-      msg += `\n\nCheck your key:  ${bold(`tlme config set-key ${providerId} <your-key>`)}`;
+      msg += `\n\nCheck your key:  ${bold(`tlme --config set-key ${providerId} <your-key>`)}`;
     }
     fail(msg);
   }
@@ -601,7 +715,7 @@ function buildSystemPrompt() {
 // ---------------------------------------------------------------------------
 async function askQuestion(question, { providerId, cfg, modelOverride }) {
   const provider = PROVIDERS[providerId];
-  const { key, source } = resolveKey(providerId, cfg);
+  const { key } = resolveKey(providerId, cfg);
 
   if (!key) {
     const envList = provider.envVars.map((v) => `  export ${v}=<your-key>`).join("\n");
@@ -609,7 +723,7 @@ async function askQuestion(question, { providerId, cfg, modelOverride }) {
       `No API key configured for ${provider.label}.\n\n` +
         `Set one either way:\n` +
         `  1. Environment variable:\n${envList}\n` +
-        `  2. Config:  ${bold(`tlme config set-key ${providerId} <your-key>`)}\n\n` +
+        `  2. Config:  ${bold(`tlme --config set-key ${providerId} <your-key>`)}\n\n` +
         `Get a key: ${provider.keyHint}`
     );
   }
@@ -639,55 +753,93 @@ async function askQuestion(question, { providerId, cfg, modelOverride }) {
     }
     let msg = `API error (${res.status}) from ${provider.label}: ${detail}`;
     if (res.status === 401 || res.status === 403) {
-      msg += `\n\nCheck your key:  ${bold(`tlme config set-key ${providerId} <your-key>`)}`;
+      msg += `\n\nCheck your key:  ${bold(`tlme --config set-key ${providerId} <your-key>`)}`;
     }
     fail(msg);
   }
 
-  await streamSSE(res, provider, source);
+  await streamSSE(res, provider, providerId, model);
+}
+
+// Find the next SSE event boundary (a blank line) regardless of line-ending
+// style: real servers use CRLF (\r\n\r\n), our mocks/others use \n\n or \r\r.
+function nextEventBoundary(buf) {
+  let at = -1;
+  let len = 0;
+  for (const sep of ["\r\n\r\n", "\n\n", "\r\r"]) {
+    const i = buf.indexOf(sep);
+    if (i !== -1 && (at === -1 || i < at)) {
+      at = i;
+      len = sep.length;
+    }
+  }
+  return { at, len };
 }
 
 // Iterate the response body, frame SSE events on blank lines, and print deltas.
-async function streamSSE(res, provider, _source) {
+async function streamSSE(res, provider, providerId, model) {
   const decoder = new TextDecoder();
   let buffer = "";
   let wroteAnything = false;
+  let lastFinish = null;
+
+  // Parse one framed SSE event: pull data: lines, surface errors, print deltas.
+  const handleEvent = (rawEvent) => {
+    for (const line of rawEvent.split(/\r\n|\r|\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+
+      let obj;
+      try {
+        obj = JSON.parse(payload);
+      } catch {
+        continue; // partial or non-JSON keep-alive; skip
+      }
+
+      const errMsg = provider.extractError(obj);
+      if (errMsg) {
+        if (wroteAnything) process.stdout.write("\n");
+        fail(`Stream error: ${errMsg}`);
+      }
+
+      if (provider.extractFinish) {
+        const f = provider.extractFinish(obj);
+        if (f) lastFinish = f;
+      }
+
+      const text = provider.extractDelta(obj);
+      if (text) {
+        process.stdout.write(text);
+        wroteAnything = true;
+      }
+    }
+  };
 
   for await (const chunk of res.body) {
     buffer += decoder.decode(chunk, { stream: true });
 
     // Events are separated by a blank line; keep the incomplete tail buffered.
-    let sep;
-    while ((sep = buffer.indexOf("\n\n")) !== -1) {
-      const rawEvent = buffer.slice(0, sep);
-      buffer = buffer.slice(sep + 2);
-
-      for (const line of rawEvent.split("\n")) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const payload = trimmed.slice(5).trim();
-        if (!payload || payload === "[DONE]") continue;
-
-        let obj;
-        try {
-          obj = JSON.parse(payload);
-        } catch {
-          continue; // partial or non-JSON keep-alive; skip
-        }
-
-        const errMsg = provider.extractError(obj);
-        if (errMsg) {
-          if (wroteAnything) process.stdout.write("\n");
-          fail(`Stream error: ${errMsg}`);
-        }
-
-        const text = provider.extractDelta(obj);
-        if (text) {
-          process.stdout.write(text);
-          wroteAnything = true;
-        }
-      }
+    let b;
+    while ((b = nextEventBoundary(buffer)).at !== -1) {
+      handleEvent(buffer.slice(0, b.at));
+      buffer = buffer.slice(b.at + b.len);
     }
+  }
+
+  // A final event may arrive without a trailing blank line — flush it.
+  if (buffer.trim()) handleEvent(buffer);
+
+  if (!wroteAnything) {
+    // A 200 that streamed no answer text: a safety/length stop, a
+    // thinking-only model that never emitted a plain answer, etc. Don't exit 0
+    // silently — say what happened and how to fix it.
+    const normal = new Set(["stop", "STOP", "end_turn", "length", "MAX_TOKENS", "FINISH_REASON_UNSPECIFIED"]);
+    let msg = `${PROVIDERS[providerId].label} returned no answer text for model "${model}".`;
+    if (lastFinish && !normal.has(lastFinish)) msg += ` (finish reason: ${lastFinish})`;
+    msg += `\nTry another model:  ${bold(`tlme --models ${providerId}`)}`;
+    fail(msg);
   }
 
   // Trailing newline so the shell prompt lands on its own line.
@@ -701,7 +853,7 @@ async function streamSSE(res, provider, _source) {
 // `tlme setup` — interactive: pick a provider, paste a key, optionally choose a
 // default model (validated against the provider's live model list).
 async function cmdSetup() {
-  requireTTY("tlme setup");
+  requireTTY("tlme --setup");
   try {
     await runSetup();
   } finally {
@@ -709,20 +861,51 @@ async function cmdSetup() {
   }
 }
 
-async function runSetup() {
-  const ids = Object.keys(PROVIDERS);
-  process.stdout.write(bold("tlme setup\n\n"));
+// Short tagline shown next to each provider on the connect screen, and which
+// section it sits under. Order here is the on-screen order.
+const PROVIDER_SETUP = {
+  claude: { group: "Popular", desc: "(Recommended)" },
+  openai: { group: "Popular", desc: "(ChatGPT Plus/Pro or API key)" },
+  google: { group: "Popular", desc: "AI Studio (Gemini)" },
+  grok: { group: "More", desc: "(xAI API key)" },
+  openrouter: { group: "More", desc: "(one key, many models)" },
+};
 
-  // Provider choice — arrow menu on a real terminal, numbered prompt otherwise.
+async function runSetup() {
+  const ids = Object.keys(PROVIDER_SETUP);
+  const cfg = loadConfig();
+
+  // Provider choice — OpenCode-style panel on a real terminal, numbered prompt
+  // otherwise.
   let providerId;
   if (canRaw()) {
-    const idx = await selectList({
-      title: "Which provider do you want to set up?",
-      items: ids.map((id) => `${PROVIDERS[id].label}  ${dim(`(${id})`)}`),
-      current: 0,
+    const groups = [];
+    for (const id of ids) {
+      const meta = PROVIDER_SETUP[id];
+      let g = groups.find((x) => x.name === meta.group);
+      if (!g) {
+        g = { name: meta.group, items: [] };
+        groups.push(g);
+      }
+      g.items.push({
+        label: PROVIDERS[id].label,
+        desc: meta.desc,
+        value: id,
+        current: cfg.provider === id,
+      });
+    }
+    providerId = await panelSelect({
+      title: "Connect a provider",
+      groups,
+      current: Math.max(0, ids.indexOf(cfg.provider)),
+      footer: "↑/↓ navigate   enter select   esc cancel",
     });
-    providerId = ids[idx];
+    if (!providerId) {
+      process.stdout.write("Cancelled.\n");
+      return;
+    }
   } else {
+    process.stdout.write(bold("tlme --setup\n\n"));
     process.stdout.write("Which provider do you want to set up?\n");
     ids.forEach((id, i) => {
       process.stdout.write(`  ${cyan(String(i + 1))}. ${PROVIDERS[id].label}  ${dim(`(${id})`)}\n`);
@@ -733,69 +916,60 @@ async function runSetup() {
   }
   const provider = PROVIDERS[providerId];
 
-  process.stdout.write(`\nGet a key here if you need one: ${provider.keyHint}\n`);
-  const key = canRaw()
-    ? await askHiddenRaw(`Paste your ${provider.label} API key: `)
-    : await askHidden(`Paste your ${provider.label} API key: `);
+  // API key entry.
+  let key;
+  if (canRaw()) {
+    key = await panelInput({
+      title: "API key",
+      placeholder: `${provider.label} API key`,
+      mask: true,
+      footer: `${dim("get one at")} ${provider.keyHint}    ${hintc("enter submit   esc cancel")}`,
+    });
+    if (key === null) {
+      process.stdout.write("Cancelled.\n");
+      return;
+    }
+  } else {
+    process.stdout.write(`\nGet a key here if you need one: ${provider.keyHint}\n`);
+    key = await askHidden(`Paste your ${provider.label} API key: `);
+  }
   if (!key) fail("No API key entered.");
 
-  const cfg = loadConfig();
   cfg.keys[providerId] = key;
   cfg.provider = providerId; // the provider you just set up becomes the default
   saveConfig(cfg);
-  process.stdout.write(`\nSaved. ${cyan(providerId)} is now your default provider.\n`);
+  process.stdout.write(`Saved. ${cyan(providerId)} is now your default provider.\n`);
 
-  // Validate the key immediately by listing models, and offer to pick a default.
-  const wantModels = await confirm("Fetch available models now to pick a default?", true);
-  if (!wantModels) {
-    process.stdout.write(`\nDone. Try:  ${bold("tlme hello there")}\n`);
-    return;
-  }
-
-  process.stdout.write(dim("\nFetching models…\n"));
+  // Validate the key immediately by listing models, then pick a default.
+  process.stdout.write(dim("Fetching models…\n"));
   const models = await fetchModels(providerId, key);
   if (models.length === 0) {
     process.stdout.write("No models returned. Using the built-in default.\n");
-    process.stdout.write(`\nDone. Try:  ${bold("tlme hello there")}\n`);
-    return;
+  } else {
+    await pickDefaultModel(providerId, cfg, models);
   }
-
-  await pickDefaultModel(providerId, cfg, models);
   process.stdout.write(`\nDone. Try:  ${bold("tlme hello there")}\n`);
 }
 
-// Yes/no confirm. Arrow menu on a terminal; [Y/n] line prompt otherwise.
-async function confirm(question, defaultYes = true) {
-  if (canRaw()) {
-    const idx = await selectList({
-      title: question,
-      items: ["Yes", "No"],
-      current: defaultYes ? 0 : 1,
-    });
-    return idx === 0;
-  }
-  const suffix = defaultYes ? "[Y/n]" : "[y/N]";
-  const answer = (await ask(`${question} ${suffix} `)).toLowerCase();
-  if (!answer) return defaultYes;
-  return answer === "y" || answer === "yes";
-}
-
-// Let the user set a default model. Arrow menu (scroll + filter) on a terminal,
-// numbered prompt otherwise.
+// Let the user set a default model. OpenCode-style panel (scroll + filter) on a
+// terminal, numbered prompt otherwise. Escape/blank keeps the current default.
 async function pickDefaultModel(providerId, cfg, models) {
   const current = resolveModel(providerId, cfg, null);
   let model;
 
   if (canRaw()) {
-    const curIdx = Math.max(0, models.indexOf(current));
-    const idx = await selectList({
-      title: `Select the default model for ${PROVIDERS[providerId].label} (current: ${current}):`,
-      items: models,
-      current: curIdx,
-      pageSize: 12,
-      filter: true,
+    model = await panelSelect({
+      title: PROVIDERS[providerId].label,
+      groups: [
+        {
+          name: "Models",
+          items: models.map((m) => ({ label: m, value: m, current: m === current })),
+        },
+      ],
+      current: Math.max(0, models.indexOf(current)),
+      footer: "↑/↓ navigate   enter select   esc keep default   type to filter",
     });
-    model = models[idx];
+    if (!model) return; // Escape → keep current default
   } else {
     process.stdout.write(`\nModels available to your ${PROVIDERS[providerId].label} key:\n`);
     models.forEach((m, i) => {
@@ -834,7 +1008,7 @@ async function cmdModels(args) {
   if (!key) {
     fail(
       `No API key configured for ${PROVIDERS[providerId].label}.\n` +
-        `Run:  ${bold("tlme setup")}   or   ${bold(`tlme config set-key ${providerId} <your-key>`)}`
+        `Run:  ${bold("tlme --setup")}   or   ${bold(`tlme --config set-key ${providerId} <your-key>`)}`
     );
   }
 
@@ -891,11 +1065,11 @@ function cmdConfig(args) {
     const key = args[2];
     if (!providerId) {
       fail(
-        `Usage: tlme config set-key <provider> <api-key>\n` +
+        `Usage: tlme --config set-key <provider> <api-key>\n` +
           `Providers: ${Object.keys(PROVIDERS).join(", ")}`
       );
     }
-    if (!key) fail(`Missing API key.\nUsage: tlme config set-key ${providerId} <api-key>`);
+    if (!key) fail(`Missing API key.\nUsage: tlme --config set-key ${providerId} <api-key>`);
     const cfg = loadConfig();
     cfg.keys[providerId] = key;
     if (!cfg.provider) cfg.provider = providerId; // first key becomes default
@@ -911,7 +1085,7 @@ function cmdConfig(args) {
     const providerId = resolveProviderId(args[1]);
     if (!providerId) {
       fail(
-        `Usage: tlme config set-provider <provider>\n` +
+        `Usage: tlme --config set-provider <provider>\n` +
           `Providers: ${Object.keys(PROVIDERS).join(", ")}`
       );
     }
@@ -926,7 +1100,7 @@ function cmdConfig(args) {
     const providerId = resolveProviderId(args[1]);
     const model = args[2];
     if (!providerId || !model) {
-      fail(`Usage: tlme config set-model <provider> <model>`);
+      fail(`Usage: tlme --config set-model <provider> <model>`);
     }
     const cfg = loadConfig();
     cfg.models[providerId] = model;
@@ -949,26 +1123,30 @@ ${bold("Usage")}
   tlme <question...>                 Ask a question (no quotes needed)
   tlme [options] <question...>
 
-${bold("Getting started")}
-  tlme setup                              Interactive: pick a provider & paste a key
-  tlme models [provider]                  List models your key can use (and set a default)
+${bold("Commands")}
+  --setup                                 Interactive: pick a provider & paste a key
+  --models [provider]                     List models your key can use (and set a default)
+  --config <sub> ...                      Manage saved config (see below)
+  --help, -h                              Show this help
 
 ${bold("Options")}
   -p, --provider <name>   Provider for this call: ${providers}
   -m, --model <name>      Override the model for this call
-  -h, --help              Show this help
 
 ${bold("Config")}
-  tlme config set-key <provider> <key>    Save an API key (chmod 600)
-  tlme config set-provider <provider>     Set the default provider
-  tlme config set-model <provider> <name> Set the default model for a provider
-  tlme config show                        Show providers, masked keys, models
+  tlme --config set-key <provider> <key>    Save an API key (chmod 600)
+  tlme --config set-provider <provider>     Set the default provider
+  tlme --config set-model <provider> <name> Set the default model for a provider
+  tlme --config show                        Show providers, masked keys, models
 
 ${bold("Examples")}
   tlme how do I create a nextjs app in this directory
   tlme -p openai explain this error briefly
   cat error.log | tlme why is this failing
   tlme --model claude-opus-4-8 refactor tips for a large react file
+  tlme --setup
+
+${dim("(The bare words setup / models / config still work as aliases.)")}
 
 ${bold("Providers & keys")}
   claude       ANTHROPIC_API_KEY          ${PROVIDERS.claude.keyHint}
@@ -1016,17 +1194,23 @@ async function main() {
     return;
   }
 
-  // Subcommands handled before flag parsing.
-  if (argv[0] === "config") {
+  // Commands, handled before flag parsing. Each is spelled as a --flag (the
+  // documented form) and also accepts the bare word as an alias.
+  const cmd = argv[0];
+  if (cmd === "--config" || cmd === "config") {
     cmdConfig(argv.slice(1));
     return;
   }
-  if (argv[0] === "setup") {
+  if (cmd === "--setup" || cmd === "setup") {
     await cmdSetup();
     return;
   }
-  if (argv[0] === "models") {
+  if (cmd === "--models" || cmd === "models") {
     await cmdModels(argv.slice(1));
+    return;
+  }
+  if (cmd === "--help" || cmd === "-h" || cmd === "help") {
+    printHelp();
     return;
   }
 
@@ -1062,9 +1246,16 @@ async function main() {
   await askQuestion(question, { providerId, cfg, modelOverride: opts.model });
 }
 
-main().catch((e) => {
-  if (e instanceof ExitSignal) return; // already reported by fail()
-  // Never surface a raw stack trace.
-  process.stderr.write(red("Error: ") + (e && e.message ? e.message : String(e)) + "\n");
-  process.exitCode = 1;
-});
+// Run as a CLI only when invoked directly (not when imported by a test).
+const _invokedDirectly =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+if (_invokedDirectly) {
+  main().catch((e) => {
+    exitAlt(); // safety net: never leave the terminal on the alternate screen
+    if (e instanceof ExitSignal) return; // already reported by fail()
+    // Never surface a raw stack trace.
+    process.stderr.write(red("Error: ") + (e && e.message ? e.message : String(e)) + "\n");
+    process.exitCode = 1;
+  });
+}

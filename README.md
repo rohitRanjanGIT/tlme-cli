@@ -30,16 +30,17 @@ This exposes a global `tlme` command. To develop without linking, run
 The fastest way in is the interactive wizard:
 
 ```bash
-tlme setup
+tlme --setup
 ```
 
-Navigate it with the **arrow keys** (↑/↓) and press **Enter** to choose — no
-typing numbers. On the model list you can just **start typing to filter** (handy
-when a provider exposes hundreds of models); the list scrolls automatically.
-Ctrl+C cancels. (On terminals that don't support raw input, it falls back to a
-numbered prompt.)
+It opens a clean, full-screen picker (think "connect a provider"): navigate with
+the **arrow keys** (↑/↓), **type to filter**, and press **Enter** to choose —
+no typing numbers. **Esc** goes back / cancels; **Ctrl+C** quits. On the model
+list the type-to-filter is handy when a provider exposes hundreds of models; the
+list scrolls automatically. (On terminals that don't support raw input, it falls
+back to a numbered prompt.)
 
-It lists the providers, asks which one you want, takes your API key (hidden as
+It lists the providers, asks which one you want, takes your API key (masked as
 you type), makes it your default, and then — using that key — fetches the live
 list of models you can actually use so you can pick a default. Then just ask:
 
@@ -67,9 +68,9 @@ Aliases work too: `anthropic`, `gpt`, `xai`, `gemini`, `googleaistudio`, `router
 ### Method 1 — config file (persisted, chmod 600)
 
 ```bash
-tlme config set-key claude sk-ant-...
-tlme config set-key openai sk-...
-tlme config set-provider claude      # choose the default provider
+tlme --config set-key claude sk-ant-...
+tlme --config set-key openai sk-...
+tlme --config set-provider claude      # choose the default provider
 ```
 
 The first key you save automatically becomes the default provider. Keys are
@@ -114,12 +115,12 @@ tlme 'is this regex correct: ^\d{3}-\d{4}$'
 
 ## Listing models
 
-`tlme models` asks the provider's API which models your key can use:
+`tlme --models` asks the provider's API which models your key can use:
 
 ```bash
-tlme models                 # models for your default provider
-tlme models openai          # models for a specific provider
-tlme models openrouter | grep gpt-5   # piped output is one model id per line
+tlme --models                 # models for your default provider
+tlme --models openai          # models for a specific provider
+tlme --models openrouter | grep gpt-5   # piped output is one model id per line
 ```
 
 In an interactive terminal it also lets you set one as your default with the same
@@ -129,22 +130,23 @@ line) so it's easy to `grep`.
 ## Config commands
 
 ```bash
-tlme setup                                # interactive: provider + key + model
-tlme models [provider]                    # list models your key can use
-tlme config set-key <provider> <key>      # save a key
-tlme config set-provider <provider>       # set the default provider
-tlme config set-model <provider> <model>  # set the default model for a provider
-tlme config show                          # list providers, masked keys, models
-tlme --help                               # full help
+tlme --setup                                # interactive: provider + key + model
+tlme --models [provider]                    # list models your key can use
+tlme --config set-key <provider> <key>      # save a key
+tlme --config set-provider <provider>       # set the default provider
+tlme --config set-model <provider> <model>  # set the default model for a provider
+tlme --config show                          # list providers, masked keys, models
+tlme --help                                 # full help
 ```
 
-`config show` prints only **masked** keys (e.g. `sk-ant-tes...6789`) and whether
-each came from an env var or the config file. The full key is never printed.
+`--config show` prints only **masked** keys (e.g. `sk-ant-tes...6789`) and
+whether each came from an env var or the config file. The full key is never
+printed.
 
 ### Default models
 
 Each provider has a sensible default you can override with `--model` or
-`config set-model`. Model availability changes over time — if a call fails with
+`--config set-model`. Model availability changes over time — if a call fails with
 an "unknown model" error, set a current one:
 
 | Provider   | Default model        |
