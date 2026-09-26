@@ -6,6 +6,7 @@
 // Sections:
 //   1. Provider registry
 //   2. Config helpers      (~/.tlme/config.json)
+//   2b. Conversation history (~/.tlme/history/<thread>.json)
 //   3. Key resolution
 //   4. Output helpers       (ANSI, TTY-aware)
 //   5. System prompt
@@ -17,6 +18,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import crypto from "node:crypto";
 import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 
@@ -33,7 +35,7 @@ function openAICompatible({ url, defaultModel, keyHint, extraHeaders = {} }) {
   return {
     defaultModel,
     keyHint,
-    build(apiKey, model, system, question) {
+    build(apiKey, model, system, messages) {
       return {
         url,
         headers: {
@@ -44,10 +46,8 @@ function openAICompatible({ url, defaultModel, keyHint, extraHeaders = {} }) {
         body: {
           model,
           max_tokens: MAX_TOKENS,
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: question },
-          ],
+          // Prior turns sit between the system prompt and the new question.
+          messages: [{ role: "system", content: system }, ...messages],
           stream: true,
         },
       };
@@ -73,7 +73,7 @@ const PROVIDERS = {
     envVars: ["ANTHROPIC_API_KEY"],
     defaultModel: "claude-sonnet-4-6",
     keyHint: "https://console.anthropic.com/settings/keys",
-    build(apiKey, model, system, question) {
+    build(apiKey, model, system, messages) {
       return {
         url: "https://api.anthropic.com/v1/messages",
         headers: {
@@ -85,7 +85,9 @@ const PROVIDERS = {
           model,
           max_tokens: MAX_TOKENS,
           system,
-          messages: [{ role: "user", content: question }],
+          // Must alternate user/assistant and open on a user turn — guaranteed
+          // by only ever appending complete exchanges (see appendExchange).
+          messages,
           stream: true,
         },
       };
@@ -145,7 +147,7 @@ const PROVIDERS = {
     envVars: ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_AI_STUDIO_API_KEY"],
     defaultModel: "gemini-2.0-flash",
     keyHint: "https://aistudio.google.com/app/apikey",
-    build(apiKey, model, system, question) {
+    build(apiKey, model, system, messages) {
       // Gemini streams SSE when ?alt=sse is set; key travels as a query param.
       const url =
         `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}` +
@@ -155,7 +157,11 @@ const PROVIDERS = {
         headers: { "content-type": "application/json" },
         body: {
           system_instruction: { parts: [{ text: system }] },
-          contents: [{ role: "user", parts: [{ text: question }] }],
+          // Gemini names the assistant role "model" rather than "assistant".
+          contents: messages.map((m) => ({
+            role: m.role === "assistant" ? "model" : "user",
+            parts: [{ text: m.content }],
+          })),
         },
       };
     },
@@ -212,7 +218,22 @@ function resolveProviderId(name) {
 const CONFIG_DIR = path.join(os.homedir(), ".tlme");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 
-// Shape: { provider: "claude", keys: {claude, openai, ...}, models: {claude, ...} }
+// Shape: { provider, keys: {...}, models: {...}, history: {enabled, scope, block} }
+const HISTORY_DEFAULTS = { enabled: true, scope: "global", block: 10 };
+const SCOPES = ["global", "terminal", "directory"];
+
+// Accept only a well-formed history block; anything odd falls back to defaults
+// so a hand-edited config can't produce a nonsense scope or a zero budget.
+function normalizeHistory(h) {
+  if (!h || typeof h !== "object") return { ...HISTORY_DEFAULTS };
+  const scope = SCOPES.includes(h.scope) ? h.scope : HISTORY_DEFAULTS.scope;
+  const block =
+    Number.isInteger(h.block) && h.block > 0 && h.block <= 200
+      ? h.block
+      : HISTORY_DEFAULTS.block;
+  return { enabled: h.enabled !== false, scope, block };
+}
+
 function loadConfig() {
   try {
     const raw = fs.readFileSync(CONFIG_PATH, "utf8");
@@ -221,9 +242,10 @@ function loadConfig() {
       provider: cfg.provider || null,
       keys: cfg.keys && typeof cfg.keys === "object" ? cfg.keys : {},
       models: cfg.models && typeof cfg.models === "object" ? cfg.models : {},
+      history: normalizeHistory(cfg.history),
     };
   } catch {
-    return { provider: null, keys: {}, models: {} };
+    return { provider: null, keys: {}, models: {}, history: { ...HISTORY_DEFAULTS } };
   }
 }
 
@@ -236,6 +258,215 @@ function saveConfig(cfg) {
   } catch {
     /* ignore (e.g. Windows) */
   }
+}
+
+// ---------------------------------------------------------------------------
+// 2b. Conversation history
+// ---------------------------------------------------------------------------
+// Each invocation is its own process, so "remembering" means persisting the
+// thread to disk and replaying it on the next call.
+//
+// A thread is keyed by scope:
+//   global    — one conversation everywhere. Needs no session detection at all,
+//               so it behaves identically in every terminal, IDE and over SSH.
+//   terminal  — one per terminal tab, keyed off the session id the emulator
+//               exports (WT_SESSION etc). Falls back to directory where there
+//               isn't one, e.g. VS Code, plain conhost, SSH, CI.
+//   directory — one per working directory.
+//
+// Budget: a thread holds `block` exchanges (default 10). The last few tick down
+// a countdown; past the budget the oldest exchange rolls off. --extend grants
+// another block.
+
+const HISTORY_DIR = path.join(CONFIG_DIR, "history");
+const WARN_WITHIN = 3; // start the countdown when this many exchanges remain
+const MAX_STORED_CHARS = 4000; // per message — see clip()
+
+// Session ids exported once per tab/pane and inherited by every child process.
+// First hit wins; TLME_SESSION is the manual override for terminals that export
+// nothing usable (`export TLME_SESSION=$$` in a shell profile).
+const SESSION_VARS = [
+  "TLME_SESSION",
+  "WT_SESSION", // Windows Terminal
+  "TERM_SESSION_ID", // macOS Terminal.app
+  "ITERM_SESSION_ID", // iTerm2
+  "TMUX_PANE", // tmux
+  "KONSOLE_DBUS_SESSION", // Konsole
+  "WINDOWID", // X11
+];
+
+function sessionSource() {
+  for (const v of SESSION_VARS) {
+    if (process.env[v]) return { via: v, value: process.env[v] };
+  }
+  return null;
+}
+
+// Resolve which thread this invocation belongs to.
+function threadScope(cfg) {
+  const scope = cfg.history.scope;
+  if (scope === "directory") {
+    return { key: `dir:${process.cwd()}`, label: `directory — ${process.cwd()}` };
+  }
+  if (scope === "terminal") {
+    const s = sessionSource();
+    if (s) return { key: `tty:${s.value}`, label: `terminal — via ${s.via}` };
+    // Degrade instead of collapsing every terminal into one shared thread.
+    return {
+      key: `dir:${process.cwd()}`,
+      label: `directory — ${process.cwd()}`,
+      note: "no terminal session id here, so this is per-directory instead",
+    };
+  }
+  return { key: "global", label: "global — shared by every terminal" };
+}
+
+function threadPath(key) {
+  const hash = crypto.createHash("sha1").update(key).digest("hex").slice(0, 16);
+  return path.join(HISTORY_DIR, `${hash}.json`);
+}
+
+// Piped context (a long diff, a stack trace) would otherwise be replayed with
+// every later question in the thread. Store a bounded prefix instead.
+function clip(text) {
+  const s = String(text);
+  if (s.length <= MAX_STORED_CHARS) return s;
+  return s.slice(0, MAX_STORED_CHARS) + "\n…[truncated]";
+}
+
+// Keep only well-formed turns: a hand-edited or partially-written file must not
+// produce a request body the API will reject.
+function sanitize(messages) {
+  if (!Array.isArray(messages)) return [];
+  const out = messages.filter(
+    (m) =>
+      m &&
+      (m.role === "user" || m.role === "assistant") &&
+      typeof m.content === "string" &&
+      m.content.length > 0
+  );
+  // Claude and Gemini both require the thread to open on a user turn.
+  while (out.length && out[0].role !== "user") out.shift();
+  return out;
+}
+
+function loadThread(cfg) {
+  const scope = threadScope(cfg);
+  const file = threadPath(scope.key);
+  let messages = [];
+  let budget = cfg.history.block;
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    messages = sanitize(raw.messages);
+    if (Number.isInteger(raw.budget) && raw.budget > 0 && raw.budget <= 500) {
+      budget = raw.budget;
+    }
+  } catch {
+    /* missing or unreadable → start a clean thread */
+  }
+  return { ...scope, file, budget, messages };
+}
+
+function saveThread(thread) {
+  fs.mkdirSync(HISTORY_DIR, { recursive: true });
+  const body = {
+    scope: thread.label,
+    budget: thread.budget,
+    updated: new Date().toISOString(),
+    messages: thread.messages,
+  };
+  fs.writeFileSync(thread.file, JSON.stringify(body, null, 2) + "\n", "utf8");
+  // Threads quote whatever you piped in, so lock them down like the key file.
+  try {
+    fs.chmodSync(thread.file, 0o600);
+  } catch {
+    /* ignore (e.g. Windows) */
+  }
+}
+
+// Append one completed exchange and roll the oldest off when over budget.
+//
+// Two deliberate choices here:
+//  * Only complete pairs are ever written, and only after a successful answer.
+//    A half-written turn would break the user/assistant alternation that Claude
+//    and Gemini require, poisoning every later call in the thread.
+//  * The thread is re-read first rather than reusing the copy loaded before the
+//    API call. That call takes seconds, during which another terminal may have
+//    written; re-reading shrinks the clobber window to milliseconds.
+function appendExchange(cfg, question, answer) {
+  const thread = loadThread(cfg);
+  thread.messages.push(
+    { role: "user", content: clip(question) },
+    { role: "assistant", content: clip(answer) }
+  );
+  const max = thread.budget * 2;
+  let rolled = 0;
+  if (thread.messages.length > max) {
+    rolled = (thread.messages.length - max) / 2;
+    thread.messages = thread.messages.slice(-max);
+  }
+  saveThread(thread);
+  return { thread, rolled };
+}
+
+function clearThread(cfg) {
+  const thread = loadThread(cfg);
+  try {
+    fs.unlinkSync(thread.file);
+  } catch {
+    /* already gone */
+  }
+  return thread;
+}
+
+// Grant another block of exchanges to the current thread.
+function extendThread(cfg, by) {
+  const thread = loadThread(cfg);
+  thread.budget += by;
+  saveThread(thread);
+  return thread;
+}
+
+// Countdown as the thread fills. stderr + TTY-only: stdout stays clean so
+// `tlme ... | grep npx` is unaffected.
+function budgetNotice(thread, rolled, block) {
+  if (!process.stderr.isTTY) return;
+  const used = thread.messages.length / 2;
+  const left = thread.budget - used;
+  let msg;
+  if (rolled > 0 || left <= 0) {
+    msg =
+      `context full at ${thread.budget} exchanges — oldest now rolling off.  ` +
+      `tlme --extend for ${block} more, tlme --history clear to start over`;
+  } else if (left <= WARN_WITHIN) {
+    msg =
+      `${left} exchange${left === 1 ? "" : "s"} left in this context.  ` +
+      `tlme --extend for ${block} more`;
+  } else {
+    return;
+  }
+  process.stderr.write(dim(msg) + "\n");
+}
+
+// A bare "extend the context" is treated as a command rather than a question.
+// Matched against the WHOLE input only: a real question that merely contains
+// these words ("how do I extend the context menu in vscode") must still reach
+// the model, so we never pattern-match inside longer input.
+const EXTEND_PATTERNS = [
+  /^(?:please[ ]+)?(?:extend|increase|widen|expand|grow)(?:[ ]+(?:the|my|this))?[ ]+context(?:[ ]+(?:window|size|limit))?(?:[ ]+by[ ]+([0-9]+))?[ ]*[.!]?$/i,
+  /^(?:give[ ]+me[ ]+)?(?:some[ ]+)?more[ ]+context(?:[ ]+please)?[ ]*[.!]?$/i,
+];
+
+// Returns the number of exchanges to add, or null if this isn't such a request.
+function extendRequest(question, block) {
+  const q = question.trim();
+  for (const re of EXTEND_PATTERNS) {
+    const m = re.exec(q);
+    if (!m) continue;
+    const by = m[1] ? Number(m[1]) : block;
+    return by > 0 && by <= 200 ? by : block;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -713,7 +944,7 @@ function buildSystemPrompt() {
 // ---------------------------------------------------------------------------
 // 6. API call + manual SSE streaming
 // ---------------------------------------------------------------------------
-async function askQuestion(question, { providerId, cfg, modelOverride }) {
+async function askQuestion(question, { providerId, cfg, modelOverride, useHistory = true }) {
   const provider = PROVIDERS[providerId];
   const { key } = resolveKey(providerId, cfg);
 
@@ -730,7 +961,16 @@ async function askQuestion(question, { providerId, cfg, modelOverride }) {
 
   const model = resolveModel(providerId, cfg, modelOverride);
   const system = buildSystemPrompt();
-  const { url, headers, body } = provider.build(key, model, system, question);
+
+  // Replay the thread, then this question. A disabled or suppressed history
+  // just means an empty prior-turn list — the request shape is the same.
+  const remember = useHistory && cfg.history.enabled;
+  const thread = remember ? loadThread(cfg) : null;
+  const messages = [
+    ...(thread ? thread.messages : []),
+    { role: "user", content: question },
+  ];
+  const { url, headers, body } = provider.build(key, model, system, messages);
 
   let res;
   try {
@@ -758,7 +998,14 @@ async function askQuestion(question, { providerId, cfg, modelOverride }) {
     fail(msg);
   }
 
-  await streamSSE(res, provider, providerId, model);
+  const answer = await streamSSE(res, provider, providerId, model);
+
+  // Record only after a successful answer, so a failed call never leaves a
+  // dangling user turn that would break user/assistant alternation.
+  if (remember && answer.trim()) {
+    const { thread: updated, rolled } = appendExchange(cfg, question, answer);
+    budgetNotice(updated, rolled, cfg.history.block);
+  }
 }
 
 // Find the next SSE event boundary (a blank line) regardless of line-ending
@@ -782,6 +1029,7 @@ async function streamSSE(res, provider, providerId, model) {
   let buffer = "";
   let wroteAnything = false;
   let lastFinish = null;
+  let answer = ""; // accumulated so the turn can be saved to history
 
   // Parse one framed SSE event: pull data: lines, surface errors, print deltas.
   const handleEvent = (rawEvent) => {
@@ -812,6 +1060,7 @@ async function streamSSE(res, provider, providerId, model) {
       const text = provider.extractDelta(obj);
       if (text) {
         process.stdout.write(text);
+        answer += text;
         wroteAnything = true;
       }
     }
@@ -844,6 +1093,7 @@ async function streamSSE(res, provider, providerId, model) {
 
   // Trailing newline so the shell prompt lands on its own line.
   process.stdout.write("\n");
+  return answer;
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1280,94 @@ async function cmdModels(args) {
   }
 }
 
+// `tlme --history [show|clear]` — inspect or reset the current thread.
+function cmdHistory(args) {
+  const cfg = loadConfig();
+  const sub = args[0];
+
+  if (sub === "clear" || sub === "reset") {
+    const thread = clearThread(cfg);
+    process.stdout.write(`Cleared the thread for ${cyan(thread.label)}.\n`);
+    return;
+  }
+  if (sub && sub !== "show") {
+    fail(`Unknown history command: ${sub}\nValid: show, clear`);
+  }
+
+  const thread = loadThread(cfg);
+  const used = thread.messages.length / 2;
+  process.stdout.write(bold("tlme history\n"));
+  process.stdout.write(`Scope:  ${cyan(cfg.history.scope)}  ${dim(thread.label)}\n`);
+  if (thread.note) process.stdout.write(`        ${dim(thread.note)}\n`);
+  process.stdout.write(`Thread: ${thread.file}\n`);
+  process.stdout.write(`Used:   ${used} / ${thread.budget} exchanges\n`);
+  if (!cfg.history.enabled) {
+    process.stdout.write(dim(`History is off — ${bold("tlme --config set-history on")}\n`));
+  }
+  if (!thread.messages.length) {
+    process.stdout.write(dim("\nNothing recorded yet.\n"));
+    return;
+  }
+  process.stdout.write("\n");
+  for (const m of thread.messages) {
+    const who = m.role === "user" ? cyan("you") : dim("ai ");
+    const flat = m.content.replace(/\s+/g, " ").trim();
+    process.stdout.write(`  ${who}  ${flat.length > 96 ? flat.slice(0, 96) + "…" : flat}\n`);
+  }
+}
+
+// `tlme --extend [n]` — grant the current thread another block of exchanges.
+function cmdExtend(args) {
+  const cfg = loadConfig();
+  if (!cfg.history.enabled) {
+    fail(`History is off, so there's no context to extend.\nTurn it on:  ${bold("tlme --config set-history on")}`);
+  }
+  let by = cfg.history.block;
+  if (args[0] !== undefined) {
+    const n = Number(args[0]);
+    if (!Number.isInteger(n) || n <= 0 || n > 200) {
+      fail(`Extend by how many exchanges? Give a whole number from 1 to 200.`);
+    }
+    by = n;
+  }
+  const thread = extendThread(cfg, by);
+  const used = thread.messages.length / 2;
+  const left = Math.max(0, thread.budget - used);
+  process.stdout.write(
+    `Context extended by ${by} — now ${cyan(String(thread.budget))} exchanges ` +
+      `(${used} used, ${left} left).\n`
+  );
+  process.stdout.write(dim(`Thread: ${thread.label}\n`));
+}
+
+// `tlme --session` — show which thread this terminal resolves to and why.
+// Mainly a way to check whether a new terminal or IDE exports a usable id.
+function cmdSession() {
+  const cfg = loadConfig();
+  const thread = loadThread(cfg);
+  process.stdout.write(bold("tlme session\n"));
+  process.stdout.write(`Scope setting: ${cyan(cfg.history.scope)}\n`);
+  process.stdout.write(`This thread:   ${thread.label}\n`);
+  if (thread.note) process.stdout.write(`               ${dim(thread.note)}\n`);
+  process.stdout.write(`File:          ${thread.file}\n\n`);
+  process.stdout.write("Terminal session ids visible from here:\n");
+  let any = false;
+  for (const v of SESSION_VARS) {
+    if (process.env[v]) {
+      process.stdout.write(`  ${check("✓")} ${v} = ${process.env[v]}\n`);
+      any = true;
+    } else {
+      process.stdout.write(`    ${dim(v.padEnd(22))}${dim("not set")}\n`);
+    }
+  }
+  if (!any) {
+    process.stdout.write(
+      dim("\nNone available, so scope=terminal falls back to per-directory here.\n") +
+        dim("Pin one yourself with:  export TLME_SESSION=$$\n")
+    );
+  }
+}
+
 function cmdConfig(args) {
   const sub = args[0];
 
@@ -1057,6 +1395,13 @@ function cmdConfig(args) {
         );
       }
     }
+
+    const thread = loadThread(cfg);
+    process.stdout.write(bold("\nHistory\n"));
+    process.stdout.write(`    state:  ${cfg.history.enabled ? "on" : dim("off")}\n`);
+    process.stdout.write(`    scope:  ${cyan(cfg.history.scope)}  ${dim(thread.label)}\n`);
+    process.stdout.write(`    budget: ${cfg.history.block} exchanges per block\n`);
+    process.stdout.write(`    used:   ${thread.messages.length / 2} / ${thread.budget}\n`);
     return;
   }
 
@@ -1109,9 +1454,56 @@ function cmdConfig(args) {
     return;
   }
 
+  if (sub === "set-scope") {
+    const scope = String(args[1] || "").toLowerCase();
+    if (!SCOPES.includes(scope)) {
+      fail(
+        `Usage: tlme --config set-scope <${SCOPES.join("|")}>\n\n` +
+          `  global     one conversation everywhere (works in every terminal)\n` +
+          `  terminal   one per terminal tab, per-directory where the terminal\n` +
+          `             exports no session id (VS Code, plain conhost, SSH, CI)\n` +
+          `  directory  one per working directory`
+      );
+    }
+    const cfg = loadConfig();
+    cfg.history.scope = scope;
+    saveConfig(cfg);
+    const thread = loadThread(cfg);
+    process.stdout.write(`History scope set to ${cyan(scope)}\n`);
+    process.stdout.write(dim(`This thread: ${thread.label}\n`));
+    if (thread.note) process.stdout.write(dim(`${thread.note}\n`));
+    return;
+  }
+
+  if (sub === "set-history") {
+    const raw = String(args[1] || "").toLowerCase();
+    const cfg = loadConfig();
+    if (raw === "off" || raw === "false" || raw === "0") {
+      cfg.history.enabled = false;
+      saveConfig(cfg);
+      process.stdout.write(`History ${dim("off")} — every question starts fresh.\n`);
+      return;
+    }
+    if (raw === "on" || raw === "true") {
+      cfg.history.enabled = true;
+      saveConfig(cfg);
+      process.stdout.write(`History ${cyan("on")} — ${cfg.history.block} exchanges per block.\n`);
+      return;
+    }
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n <= 0 || n > 200) {
+      fail(`Usage: tlme --config set-history <exchanges|on|off>   (1-200)`);
+    }
+    cfg.history.enabled = true;
+    cfg.history.block = n;
+    saveConfig(cfg);
+    process.stdout.write(`History budget set to ${cyan(String(n))} exchanges per block.\n`);
+    return;
+  }
+
   fail(
     `Unknown config command: ${sub || "(none)"}\n` +
-      `Valid: set-key, set-provider, set-model, show`
+      `Valid: set-key, set-provider, set-model, set-scope, set-history, show`
   );
 }
 
@@ -1126,18 +1518,33 @@ ${bold("Usage")}
 ${bold("Commands")}
   --setup                                 Interactive: pick a provider & paste a key
   --models [provider]                     List models your key can use (and set a default)
+  --history [clear]                       Show the current conversation, or reset it
+  --extend [n]                            Add another ${HISTORY_DEFAULTS.block} exchanges of context
+  --session                               Which thread this terminal maps to, and why
   --config <sub> ...                      Manage saved config (see below)
   --help, -h                              Show this help
 
 ${bold("Options")}
   -p, --provider <name>   Provider for this call: ${providers}
   -m, --model <name>      Override the model for this call
+  --no-history            Ask as a one-off: ignore and don't record context
 
 ${bold("Config")}
   tlme --config set-key <provider> <key>    Save an API key (chmod 600)
   tlme --config set-provider <provider>     Set the default provider
   tlme --config set-model <provider> <name> Set the default model for a provider
+  tlme --config set-scope <scope>           global | terminal | directory
+  tlme --config set-history <n|on|off>      Exchanges per block, or turn it off
   tlme --config show                        Show providers, masked keys, models
+
+${bold("Context")}
+  tlme remembers the last ${HISTORY_DEFAULTS.block} exchanges so follow-ups just work. It counts
+  down when ${WARN_WITHIN} are left; past the budget the oldest exchange rolls off.
+  Widen it with ${bold("tlme --extend")} (or just ask: ${bold("tlme extend the context")}).
+
+  Scope decides what "the conversation" means — global (default) is one thread
+  shared by every terminal; terminal gives each tab its own; directory keys it
+  to the project. Check yours with ${bold("tlme --session")}.
 
 ${bold("Examples")}
   tlme how do I create a nextjs app in this directory
@@ -1164,19 +1571,75 @@ Keys resolve as: environment variable first, then ${CONFIG_PATH}.
 // 8. Arg parsing + entry point
 // ---------------------------------------------------------------------------
 // Read piped stdin (nice-to-have): `cat file | tlme why is this broken`.
+//
+// isTTY alone can't tell us whether anything is actually coming. A script or CI
+// runner can hand us a stdin that is neither a terminal nor ever closed, and
+// `for await` would then wait for an EOF that never arrives — a hang with no
+// output at all. Type-sniffing doesn't help: on Windows a real pipe and that
+// inherited handle are indistinguishable (fstat reports neither as a FIFO), so
+// the only portable signal is whether data shows up.
+//
+// So wait for the first byte, then read to EOF with no further limit — a slow or
+// large producer is fine once it has started. If nothing arrives at all within
+// the grace window, assume there's no piped input and carry on. A producer that
+// is slow to emit its *first* byte needs a longer window: TLME_STDIN_WAIT=<ms>.
+const STDIN_GRACE_MS = 2000;
+
 async function readStdin() {
   if (process.stdin.isTTY) return "";
+
+  const stdin = process.stdin;
+  const grace = Number(process.env.TLME_STDIN_WAIT) || STDIN_GRACE_MS;
   const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(chunk);
+
+  const outcome = await new Promise((resolve) => {
+    const finish = (how) => {
+      clearTimeout(timer);
+      stdin.off("readable", onReadable);
+      stdin.off("end", onDone);
+      stdin.off("error", onDone);
+      resolve(how);
+    };
+    const onReadable = () => {
+      const c = stdin.read();
+      if (c === null) return; // woke up with nothing buffered yet
+      chunks.push(c);
+      finish("data");
+    };
+    const onDone = () => finish("end");
+    const timer = setTimeout(() => finish("timeout"), grace);
+    stdin.on("readable", onReadable);
+    stdin.once("end", onDone);
+    stdin.once("error", onDone);
+  });
+
+  // Nothing ever showed up: treat it as "no piped input" rather than hanging.
+  // The handle is still open and would keep the event loop alive long after the
+  // answer has printed, so let go of it explicitly — otherwise the hang just
+  // moves from before the output to after it.
+  if (outcome === "timeout") {
+    stdin.pause();
+    try {
+      stdin.unref();
+    } catch {
+      /* not all stdin stream types expose unref */
+    }
+    return "";
+  }
+  // Something did: drain the rest without a deadline.
+  if (outcome === "data") {
+    for await (const chunk of stdin) chunks.push(chunk);
+  }
   return Buffer.concat(chunks).toString("utf8").trim();
 }
 
 function parseArgs(argv) {
-  const opts = { provider: null, model: null, help: false };
+  const opts = { provider: null, model: null, help: false, noHistory: false };
   const rest = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") opts.help = true;
+    else if (a === "--no-history" || a === "--fresh") opts.noHistory = true;
     else if (a === "-p" || a === "--provider") opts.provider = argv[++i];
     else if (a === "-m" || a === "--model") opts.model = argv[++i];
     else if (a.startsWith("--provider=")) opts.provider = a.slice("--provider=".length);
@@ -1196,20 +1659,43 @@ async function main() {
 
   // Commands, handled before flag parsing. Each is spelled as a --flag (the
   // documented form) and also accepts the bare word as an alias.
+  // A bare word only counts as a command when everything after it looks like
+  // that command's own arguments. Otherwise "tlme setup nginx on ubuntu" and
+  // "tlme extend the context" get swallowed as commands carrying junk arguments
+  // instead of reaching the model. The --flag spelling is always unambiguous.
   const cmd = argv[0];
-  if (cmd === "--config" || cmd === "config") {
-    cmdConfig(argv.slice(1));
+  const tail = argv.slice(1);
+  const bare = (word, allowed) =>
+    cmd === word && tail.every((a) => allowed.includes(a.toLowerCase()) || /^[0-9]+$/.test(a));
+
+  const CONFIG_SUBS = ["set-key", "set-provider", "set-model", "set-scope", "set-history", "show"];
+
+  if (cmd === "--config" || (cmd === "config" && CONFIG_SUBS.includes(String(tail[0] || "").toLowerCase()))) {
+    cmdConfig(tail);
     return;
   }
-  if (cmd === "--setup" || cmd === "setup") {
+  if (cmd === "--setup" || bare("setup", [])) {
     await cmdSetup();
     return;
   }
-  if (cmd === "--models" || cmd === "models") {
-    await cmdModels(argv.slice(1));
+  // `tlme models` / `tlme models openai`; "tlme models of gpt" is a question.
+  if (cmd === "--models" || (cmd === "models" && tail.every((a) => resolveProviderId(a)))) {
+    await cmdModels(tail);
     return;
   }
-  if (cmd === "--help" || cmd === "-h" || cmd === "help") {
+  if (cmd === "--history" || bare("history", ["show", "clear", "reset"])) {
+    cmdHistory(tail);
+    return;
+  }
+  if (cmd === "--extend" || bare("extend", [])) {
+    cmdExtend(tail);
+    return;
+  }
+  if (cmd === "--session" || bare("session", [])) {
+    cmdSession();
+    return;
+  }
+  if (cmd === "--help" || cmd === "-h" || bare("help", [])) {
     printHelp();
     return;
   }
@@ -1238,12 +1724,28 @@ async function main() {
 
   // Assemble the question; prepend any piped stdin as context.
   let question = rest.join(" ");
+
+  // A bare "extend the context" is the command, not something to ask the model.
+  // Checked before stdin so it stays a cheap local action with no API call.
+  if (cfg.history.enabled && !opts.noHistory) {
+    const by = extendRequest(question, cfg.history.block);
+    if (by) {
+      cmdExtend([String(by)]);
+      return;
+    }
+  }
+
   const piped = await readStdin();
   if (piped) {
     question = `${question}\n\n--- piped input ---\n${piped}`;
   }
 
-  await askQuestion(question, { providerId, cfg, modelOverride: opts.model });
+  await askQuestion(question, {
+    providerId,
+    cfg,
+    modelOverride: opts.model,
+    useHistory: !opts.noHistory,
+  });
 }
 
 // Run as a CLI only when invoked directly (not when imported by a test).
