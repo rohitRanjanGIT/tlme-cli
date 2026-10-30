@@ -1,7 +1,7 @@
 {
   "name": "tlme-cli",
   "version": "1.0.0",
-  "description": "Ask AI questions straight from your terminal — multi-provider (Claude, OpenAI, Grok, Google AI Studio, OpenRouter), zero dependencies, streamed answers.",
+  "description": "Ask AI questions straight from your terminal — multi-provider (Claude, OpenAI, Grok, Google AI Studio, OpenRouter, Ollama), zero dependencies, streamed answers.",
   "type": "module",
   "bin": {
     "tlme": "index.js"
@@ -30,7 +30,9 @@
     "openai",
     "grok",
     "gemini",
-    "openrouter"
+    "openrouter",
+    "ollama",
+    "local-llm"
   ],
   "license": "MIT"
 }

@@ -1,8 +1,8 @@
 # tlme
 
 Ask AI questions straight from your terminal and get **streamed** answers inline.
-Multi-provider — **Claude, OpenAI, Grok, Google AI Studio, OpenRouter** — with
-**zero npm dependencies** (native `fetch` + `node:*` only).
+Multi-provider — **Claude, OpenAI, Grok, Google AI Studio, OpenRouter, and local
+models via Ollama** — with **zero npm dependencies** (native `fetch` + `node:*` only).
 
 ```bash
 $ tlme how to create a nextjs app in this directory
@@ -52,7 +52,8 @@ Prefer to do it by hand? See the manual setup below.
 
 ## Setup an API key
 
-`tlme` supports five providers. Pick one (or several) and add a key. Keys resolve
+`tlme` supports six providers. Pick one (or several) and add a key — or skip
+keys entirely and [run models locally with Ollama](#local-models-with-ollama). Keys resolve
 in this order: **environment variable first, then the config file.**
 
 | Provider   | `--provider`  | Env var(s)                              | Get a key |
@@ -62,8 +63,9 @@ in this order: **environment variable first, then the config file.**
 | Grok (xAI) | `grok`        | `XAI_API_KEY` / `GROK_API_KEY`          | https://console.x.ai/ |
 | Google     | `google`      | `GEMINI_API_KEY` / `GOOGLE_API_KEY`     | https://aistudio.google.com/app/apikey |
 | OpenRouter | `openrouter`  | `OPENROUTER_API_KEY`                    | https://openrouter.ai/keys |
+| Ollama     | `ollama`      | none needed (`OLLAMA_HOST` for address) | https://ollama.com/download |
 
-Aliases work too: `anthropic`, `gpt`, `xai`, `gemini`, `googleaistudio`, `router`.
+Aliases work too: `anthropic`, `gpt`, `xai`, `gemini`, `googleaistudio`, `router`, `local`.
 
 ### Method 1 — config file (persisted, chmod 600)
 
@@ -84,6 +86,42 @@ export ANTHROPIC_API_KEY=sk-ant-...
 export OPENAI_API_KEY=sk-...
 ```
 
+## Local models with Ollama
+
+Run models on your own machine — no key, no account, nothing leaves your
+computer. Install [Ollama](https://ollama.com/download), pull a model, then point
+`tlme` at it:
+
+```bash
+ollama pull llama3.2
+tlme --setup                # pick "Ollama (local)" — it checks the server and lists your models
+# or by hand:
+tlme --config set-provider ollama
+tlme --models ollama        # what you've pulled; pick a default
+```
+
+With no default model set, `tlme` uses the first model Ollama reports, so a fresh
+install answers straight away.
+
+**Server address.** Defaults to `http://127.0.0.1:11434`. For Ollama on another
+machine or port:
+
+```bash
+tlme --config set-host http://192.168.1.20:11434
+tlme --config set-host default        # back to localhost
+export OLLAMA_HOST=192.168.1.20:11434 # env var wins over config, like keys do
+```
+
+Ollama's own `OLLAMA_HOST` forms are accepted — a bare `host:port`, or
+`0.0.0.0` (treated as `127.0.0.1`) — as is a URL pasted with a trailing `/v1`.
+
+**Auth.** Local Ollama needs no key. For Ollama Cloud or a server behind an
+authenticating proxy, set `OLLAMA_API_KEY` or `tlme --config set-key ollama <key>`;
+it's sent as a bearer token only when present.
+
+If Ollama isn't running, `tlme` says so and tells you to `ollama serve`; if a
+model isn't pulled, it gives you the `ollama pull` line.
+
 ## Usage
 
 ```bash
@@ -97,6 +135,7 @@ tlme --provider grok what changed in HTTP/3
 # Override the model per call
 tlme --model claude-opus-4-8 give me refactor ideas for a big react file
 tlme -p openrouter -m anthropic/claude-3.5-sonnet summarize REST vs gRPC
+tlme -p ollama -m qwen2.5:7b explain this regex
 
 # Pipe input as context
 cat error.log | tlme why is this failing
@@ -209,6 +248,18 @@ session explicitly, export your own in your shell profile:
 export TLME_SESSION=$$    # one thread per shell
 ```
 
+### Resetting session settings
+
+```bash
+tlme -rs                  # or: tlme --reset-session / tlme --session reset
+```
+
+Puts the session settings back to defaults — history **on**, scope **global**,
+**10** exchanges per block — and clears any `--extend` grant on your thread
+(trimming to the newest 10 exchanges, as rollover would). The conversation
+itself is kept; use `tlme --history clear` to wipe it. Keys, providers and
+models are untouched.
+
 Threads live in `~/.tlme/history/`, one JSON file each, `chmod 600` like the
 config. They quote whatever you piped in, so each stored message is capped at
 4 KB — a big `git diff` won't be replayed with every later question.
@@ -221,12 +272,14 @@ tlme --models [provider]                    # list models your key can use
 tlme --config set-key <provider> <key>      # save a key
 tlme --config set-provider <provider>       # set the default provider
 tlme --config set-model <provider> <model>  # set the default model for a provider
+tlme --config set-host <url|default>        # where Ollama runs
 tlme --config set-scope <scope>             # global | terminal | directory
 tlme --config set-history <n|on|off>        # exchanges per block, or turn it off
 tlme --config show                          # providers, masked keys, models, context
 tlme --history [clear]                      # show or reset the current thread
 tlme --extend [n]                           # widen the current context
 tlme --session                              # which thread this terminal maps to
+tlme -rs                                    # reset session settings to defaults
 tlme --help                                 # full help
 ```
 
@@ -247,6 +300,7 @@ an "unknown model" error, set a current one:
 | Grok       | `grok-2-latest`      |
 | Google     | `gemini-2.0-flash`   |
 | OpenRouter | `openai/gpt-4o`      |
+| Ollama     | first installed model |
 
 ## How it works
 
@@ -255,8 +309,8 @@ an "unknown model" error, set a current one:
 - **Live streaming.** Requests use `stream: true` and the tool parses the
   Server-Sent Events stream by hand, writing text deltas to stdout as they
   arrive — you read the answer while it's being generated.
-- **One dialect, many providers.** OpenAI, Grok, and OpenRouter share the
-  OpenAI chat-completions format; Claude and Gemini each get their own request
+- **One dialect, many providers.** OpenAI, Grok, OpenRouter, and Ollama (via
+  its `/v1` endpoint) share the OpenAI chat-completions format; Claude and Gemini each get their own request
   builder and delta extractor.
 - **Context-aware.** The system prompt injects your OS, shell, and current
   directory so "in this directory" questions get tailored commands.

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // tlme — ask AI questions straight from your terminal.
-// Multi-provider (Claude, OpenAI, Grok, Google AI Studio, OpenRouter).
+// Multi-provider (Claude, OpenAI, Grok, Google AI Studio, OpenRouter, Ollama).
 // Zero npm dependencies: native fetch + node:* only. ESM.
 //
 // Sections:
@@ -187,6 +187,57 @@ const PROVIDERS = {
         .map((m) => (m.name || "").replace(/^models\//, ""))
         .filter(Boolean),
   },
+
+  // Ollama runs models on your own machine, so there's no key to collect —
+  // only where the server lives. It speaks the OpenAI chat/completions dialect
+  // at /v1, so the SSE parsing is shared; models come from its native /api/tags,
+  // which every Ollama version has.
+  //
+  // A key is still accepted (OLLAMA_API_KEY or set-key) for Ollama Cloud or a
+  // server behind an authenticating proxy; it is sent only when present.
+  ollama: {
+    label: "Ollama (local)",
+    envVars: ["OLLAMA_API_KEY"],
+    keyOptional: true,
+    hostEnvVars: ["OLLAMA_HOST"],
+    // 127.0.0.1 rather than "localhost": on some systems localhost resolves to
+    // ::1 first while Ollama only listens on IPv4, which looks like it's down.
+    defaultHost: "http://127.0.0.1:11434",
+    keyHint: "https://ollama.com/download",
+    ...openAICompatible({ url: "", defaultModel: null, keyHint: "https://ollama.com/download" }),
+    // No fixed default: the first installed model is used (see pickModel),
+    // because which models exist depends entirely on what you've pulled.
+    defaultModel: null,
+    build(apiKey, model, system, messages, { baseUrl }) {
+      return {
+        url: `${baseUrl}/v1/chat/completions`,
+        headers: {
+          "content-type": "application/json",
+          ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: {
+          model,
+          max_tokens: MAX_TOKENS,
+          messages: [{ role: "system", content: system }, ...messages],
+          stream: true,
+        },
+      };
+    },
+    modelsRequest: (apiKey, { baseUrl }) => ({
+      url: `${baseUrl}/api/tags`,
+      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+    }),
+    parseModels: (j) => (j?.models || []).map((m) => m.name || m.model).filter(Boolean),
+    // The two failures people actually hit, translated into the fix.
+    networkHint: (baseUrl) =>
+      `Couldn't reach Ollama at ${baseUrl}. Is it running?\n` +
+      `  Start it:        ${bold("ollama serve")}   (or open the Ollama app)\n` +
+      `  Different host:  ${bold("tlme --config set-host <url>")}   or   export OLLAMA_HOST=<url>`,
+    errorHint: (status, detail, model) =>
+      status === 404 && /model/i.test(detail || "")
+        ? `\n\nPull it first:  ${bold(`ollama pull ${model}`)}\nOr pick an installed one:  ${bold("tlme --models ollama")}`
+        : "",
+  },
 };
 
 // Friendly aliases → canonical provider id.
@@ -205,6 +256,8 @@ const ALIASES = {
   aistudio: "google",
   openrouter: "openrouter",
   router: "openrouter",
+  ollama: "ollama",
+  local: "ollama",
 };
 
 function resolveProviderId(name) {
@@ -218,7 +271,7 @@ function resolveProviderId(name) {
 const CONFIG_DIR = path.join(os.homedir(), ".tlme");
 const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
 
-// Shape: { provider, keys: {...}, models: {...}, history: {enabled, scope, block} }
+// Shape: { provider, keys: {...}, models: {...}, hosts: {...}, history: {enabled, scope, block} }
 const HISTORY_DEFAULTS = { enabled: true, scope: "global", block: 10 };
 const SCOPES = ["global", "terminal", "directory"];
 
@@ -242,10 +295,11 @@ function loadConfig() {
       provider: cfg.provider || null,
       keys: cfg.keys && typeof cfg.keys === "object" ? cfg.keys : {},
       models: cfg.models && typeof cfg.models === "object" ? cfg.models : {},
+      hosts: cfg.hosts && typeof cfg.hosts === "object" ? cfg.hosts : {},
       history: normalizeHistory(cfg.history),
     };
   } catch {
-    return { provider: null, keys: {}, models: {}, history: { ...HISTORY_DEFAULTS } };
+    return { provider: null, keys: {}, models: {}, hosts: {}, history: { ...HISTORY_DEFAULTS } };
   }
 }
 
@@ -488,6 +542,55 @@ function resolveKey(providerId, cfg) {
 function resolveModel(providerId, cfg, override) {
   if (override) return override;
   return cfg.models[providerId] || PROVIDERS[providerId].defaultModel;
+}
+
+// Turn whatever people put in OLLAMA_HOST into a usable base URL. Ollama's own
+// convention allows a bare "host:port" or even "0.0.0.0" (a bind address you
+// can't connect to on every OS), and people paste URLs ending in /v1 or /api.
+function normalizeHost(raw) {
+  let s = String(raw || "").trim();
+  if (!s) return null;
+  const hadScheme = /^https?:\/\//i.test(s);
+  if (!hadScheme) s = "http://" + s;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  if (u.hostname === "0.0.0.0") u.hostname = "127.0.0.1";
+  if (!hadScheme && !u.port) u.port = "11434"; // bare host → Ollama's port
+  const p = u.pathname.replace(/\/+$/, "").replace(/\/(v1|api)$/, "");
+  return `${u.protocol}//${u.host}${p}`;
+}
+
+// Where a self-hosted provider lives: env var > config > built-in default.
+// Providers with no host concept (the hosted APIs) return null.
+function resolveHost(providerId, cfg) {
+  const provider = PROVIDERS[providerId];
+  if (!provider.defaultHost) return { url: null, source: null };
+  for (const v of provider.hostEnvVars || []) {
+    const u = normalizeHost(process.env[v]);
+    if (u) return { url: u, source: `env var (${v})` };
+  }
+  const saved = normalizeHost(cfg.hosts?.[providerId]);
+  if (saved) return { url: saved, source: "config file" };
+  return { url: provider.defaultHost, source: "default" };
+}
+
+// The configured model, or — for providers with no fixed default (Ollama) —
+// the first model actually installed, so a fresh install answers immediately.
+async function pickModel(providerId, cfg, override, key, baseUrl) {
+  const model = resolveModel(providerId, cfg, override);
+  if (model) return model;
+  const models = await fetchModels(providerId, key, baseUrl);
+  if (!models.length) {
+    fail(
+      `${PROVIDERS[providerId].label} has no models installed yet.\n` +
+        `Pull one:  ${bold("ollama pull llama3.2")}   then ask again.`
+    );
+  }
+  return models[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -885,16 +988,28 @@ function panelInput({ title, placeholder = "Value", mask = true, footer = "enter
   });
 }
 
+// fetch() rejects with a bare "fetch failed"; the useful part (ECONNREFUSED,
+// ENOTFOUND…) is on e.cause. Local providers also get a "is it running?" hint.
+function networkMessage(provider, baseUrl, e) {
+  const why = e?.cause?.code || e?.cause?.message || e?.message || String(e);
+  if (provider.networkHint && baseUrl) return `${provider.networkHint(baseUrl)}\n${dim(`(${why})`)}`;
+  return `Network error: ${why}`;
+}
+
+function keyFixHint(providerId) {
+  return `\n\nCheck your key:  ${bold(`tlme --config set-key ${providerId} <your-key>`)}`;
+}
+
 // GET the list of model ids available to a key. Same fail() semantics as chat.
-async function fetchModels(providerId, key) {
+async function fetchModels(providerId, key, baseUrl = null) {
   const provider = PROVIDERS[providerId];
-  const { url, headers } = provider.modelsRequest(key);
+  const { url, headers } = provider.modelsRequest(key, { baseUrl });
 
   let res;
   try {
     res = await fetch(url, { method: "GET", headers });
   } catch (e) {
-    fail(`Network error: ${e.message}`);
+    fail(networkMessage(provider, baseUrl, e));
   }
 
   if (!res.ok) {
@@ -906,9 +1021,7 @@ async function fetchModels(providerId, key) {
       /* not JSON */
     }
     let msg = `API error (${res.status}) from ${provider.label}: ${detail}`;
-    if (res.status === 401 || res.status === 403) {
-      msg += `\n\nCheck your key:  ${bold(`tlme --config set-key ${providerId} <your-key>`)}`;
-    }
+    if (res.status === 401 || res.status === 403) msg += keyFixHint(providerId);
     fail(msg);
   }
 
@@ -948,7 +1061,7 @@ async function askQuestion(question, { providerId, cfg, modelOverride, useHistor
   const provider = PROVIDERS[providerId];
   const { key } = resolveKey(providerId, cfg);
 
-  if (!key) {
+  if (!key && !provider.keyOptional) {
     const envList = provider.envVars.map((v) => `  export ${v}=<your-key>`).join("\n");
     fail(
       `No API key configured for ${provider.label}.\n\n` +
@@ -959,7 +1072,8 @@ async function askQuestion(question, { providerId, cfg, modelOverride, useHistor
     );
   }
 
-  const model = resolveModel(providerId, cfg, modelOverride);
+  const { url: baseUrl } = resolveHost(providerId, cfg);
+  const model = await pickModel(providerId, cfg, modelOverride, key, baseUrl);
   const system = buildSystemPrompt();
 
   // Replay the thread, then this question. A disabled or suppressed history
@@ -970,7 +1084,7 @@ async function askQuestion(question, { providerId, cfg, modelOverride, useHistor
     ...(thread ? thread.messages : []),
     { role: "user", content: question },
   ];
-  const { url, headers, body } = provider.build(key, model, system, messages);
+  const { url, headers, body } = provider.build(key, model, system, messages, { baseUrl });
 
   let res;
   try {
@@ -980,7 +1094,7 @@ async function askQuestion(question, { providerId, cfg, modelOverride, useHistor
       body: JSON.stringify(body),
     });
   } catch (e) {
-    fail(`Network error: ${e.message}`);
+    fail(networkMessage(provider, baseUrl, e));
   }
 
   if (!res.ok) {
@@ -992,9 +1106,8 @@ async function askQuestion(question, { providerId, cfg, modelOverride, useHistor
       /* body wasn't JSON */
     }
     let msg = `API error (${res.status}) from ${provider.label}: ${detail}`;
-    if (res.status === 401 || res.status === 403) {
-      msg += `\n\nCheck your key:  ${bold(`tlme --config set-key ${providerId} <your-key>`)}`;
-    }
+    if (res.status === 401 || res.status === 403) msg += keyFixHint(providerId);
+    if (provider.errorHint) msg += provider.errorHint(res.status, detail, model);
     fail(msg);
   }
 
@@ -1119,6 +1232,7 @@ const PROVIDER_SETUP = {
   google: { group: "Popular", desc: "AI Studio (Gemini)" },
   grok: { group: "More", desc: "(xAI API key)" },
   openrouter: { group: "More", desc: "(one key, many models)" },
+  ollama: { group: "Local", desc: "(runs on your machine, no key)" },
 };
 
 async function runSetup() {
@@ -1166,6 +1280,12 @@ async function runSetup() {
   }
   const provider = PROVIDERS[providerId];
 
+  // Keyless local providers ask where the server is instead of for a key.
+  if (provider.keyOptional) {
+    await setupLocal(providerId, cfg);
+    return;
+  }
+
   // API key entry.
   let key;
   if (canRaw()) {
@@ -1198,6 +1318,56 @@ async function runSetup() {
   } else {
     await pickDefaultModel(providerId, cfg, models);
   }
+  process.stdout.write(`\nDone. Try:  ${bold("tlme hello there")}\n`);
+}
+
+// Setup for a provider that runs locally (Ollama): confirm the host, prove the
+// server answers by listing its models, then pick a default.
+async function setupLocal(providerId, cfg) {
+  const provider = PROVIDERS[providerId];
+  const current = resolveHost(providerId, cfg);
+
+  let raw;
+  if (canRaw()) {
+    raw = await panelInput({
+      title: `${provider.label} — server address`,
+      placeholder: `${current.url}  (enter to keep)`,
+      mask: false,
+      footer: `${dim("install:")} ${provider.keyHint}    ${hintc("enter submit   esc cancel")}`,
+    });
+    if (raw === null) {
+      process.stdout.write("Cancelled.\n");
+      return;
+    }
+  } else {
+    process.stdout.write(`\nInstall Ollama if you haven't: ${provider.keyHint}\n`);
+    raw = await ask(`Ollama server address [${current.url}]: `);
+  }
+
+  let host = current.url;
+  if (raw) {
+    host = normalizeHost(raw);
+    if (!host) fail(`Not a valid address: ${raw}\nExample: http://127.0.0.1:11434`);
+  }
+  if (host === provider.defaultHost) delete cfg.hosts[providerId];
+  else cfg.hosts[providerId] = host;
+  cfg.provider = providerId;
+  saveConfig(cfg);
+  process.stdout.write(`Saved. ${cyan(providerId)} is now your default provider (${host}).\n`);
+  if (current.source?.startsWith("env var") && raw) {
+    process.stdout.write(dim(`Note: ${current.source} is set and still takes priority over this.\n`));
+  }
+
+  process.stdout.write(dim("Checking the server…\n"));
+  const { key } = resolveKey(providerId, cfg);
+  const models = await fetchModels(providerId, key, resolveHost(providerId, cfg).url);
+  if (models.length === 0) {
+    process.stdout.write(
+      `Ollama is running but has no models yet. Pull one:  ${bold("ollama pull llama3.2")}\n`
+    );
+    return;
+  }
+  await pickDefaultModel(providerId, cfg, models);
   process.stdout.write(`\nDone. Try:  ${bold("tlme hello there")}\n`);
 }
 
@@ -1255,14 +1425,14 @@ async function cmdModels(args) {
   }
 
   const { key } = resolveKey(providerId, cfg);
-  if (!key) {
+  if (!key && !PROVIDERS[providerId].keyOptional) {
     fail(
       `No API key configured for ${PROVIDERS[providerId].label}.\n` +
         `Run:  ${bold("tlme --setup")}   or   ${bold(`tlme --config set-key ${providerId} <your-key>`)}`
     );
   }
 
-  const models = await fetchModels(providerId, key);
+  const models = await fetchModels(providerId, key, resolveHost(providerId, cfg).url);
   if (models.length === 0) {
     process.stdout.write(`No models returned for ${PROVIDERS[providerId].label}.\n`);
     return;
@@ -1366,6 +1536,58 @@ function cmdSession() {
         dim("Pin one yourself with:  export TLME_SESSION=$$\n")
     );
   }
+  process.stdout.write(
+    `\nHistory ${cfg.history.enabled ? "on" : "off"}, ${cfg.history.block} exchanges per block, ` +
+      `${thread.messages.length / 2} / ${thread.budget} used.\n` +
+      dim(`Reset these session settings to defaults:  tlme -rs\n`)
+  );
+}
+
+// `tlme -rs` / `--reset-session` — put the session settings back to defaults:
+// history on, scope global, the default exchange budget, and drop any --extend
+// grant on the thread. The conversation itself is kept; `--history clear`
+// wipes it. Nothing here touches keys, providers or models.
+function cmdResetSession() {
+  const cfg = loadConfig();
+  const before = { ...cfg.history };
+  const oldThread = loadThread(cfg);
+
+  cfg.history = { ...HISTORY_DEFAULTS };
+  saveConfig(cfg);
+  const newThread = loadThread(cfg);
+
+  // An --extend grant is stored on the thread file, not in config. Reset it on
+  // the thread you were in and the one you're in now (they differ when the
+  // scope changed), trimming to the default block the same way rollover would.
+  const extended = [];
+  const seen = new Set();
+  for (const t of [oldThread, newThread]) {
+    if (seen.has(t.file) || !fs.existsSync(t.file)) continue;
+    seen.add(t.file);
+    if (t.budget === cfg.history.block) continue;
+    const had = t.messages.length / 2;
+    t.budget = cfg.history.block;
+    t.messages = t.messages.slice(-cfg.history.block * 2);
+    saveThread(t);
+    extended.push({ label: t.label, dropped: had - t.messages.length / 2 });
+  }
+
+  const was = (changed, old) => (changed ? dim(`  (was ${old})`) : "");
+  process.stdout.write(bold("Session settings reset to defaults\n"));
+  process.stdout.write(
+    `  history:  ${cyan("on")}${was(!before.enabled, "off")}\n` +
+      `  scope:    ${cyan(cfg.history.scope)}${was(before.scope !== cfg.history.scope, before.scope)}\n` +
+      `  budget:   ${cyan(String(cfg.history.block))} exchanges per block` +
+      `${was(before.block !== cfg.history.block, before.block)}\n`
+  );
+  for (const e of extended) {
+    process.stdout.write(
+      `  extend:   cleared on ${e.label}` +
+        (e.dropped > 0 ? dim(`  (oldest ${e.dropped} exchange${e.dropped === 1 ? "" : "s"} rolled off)`) : "") +
+        "\n"
+    );
+  }
+  process.stdout.write(dim(`Conversation kept — wipe it with:  tlme --history clear\n`));
 }
 
 function cmdConfig(args) {
@@ -1383,6 +1605,16 @@ function cmdConfig(args) {
       const { key, source } = resolveKey(id, cfg);
       const model = resolveModel(id, cfg, null);
       const marker = id === activeProvider ? bold("* ") : "  ";
+      if (provider.keyOptional) {
+        const host = resolveHost(id, cfg);
+        process.stdout.write(
+          `${marker}${provider.label}\n` +
+            `    host:   ${host.url}  ${dim(`(${host.source})`)}\n` +
+            `    key:    ${key ? `${maskKey(key)}  ${dim(`(${source})`)}` : dim("none needed")}\n` +
+            `    model:  ${model || dim("first installed model")}\n`
+        );
+        continue;
+      }
       if (key) {
         process.stdout.write(
           `${marker}${provider.label}\n` +
@@ -1454,6 +1686,37 @@ function cmdConfig(args) {
     return;
   }
 
+  if (sub === "set-host") {
+    // `set-host <url>` (Ollama is the only self-hosted provider) or
+    // `set-host ollama <url>`; `set-host default` goes back to localhost.
+    let providerId = "ollama";
+    let raw = args[1];
+    if (resolveProviderId(args[1]) && args[2] !== undefined) {
+      providerId = resolveProviderId(args[1]);
+      raw = args[2];
+    }
+    const provider = PROVIDERS[providerId];
+    if (!provider.defaultHost) fail(`${provider.label} is a hosted API — there's no host to set.`);
+    if (!raw) fail(`Usage: tlme --config set-host <url|default>\nExample: tlme --config set-host http://192.168.1.20:11434`);
+    const cfg = loadConfig();
+    if (String(raw).toLowerCase() === "default") {
+      delete cfg.hosts[providerId];
+      saveConfig(cfg);
+      process.stdout.write(`${provider.label} host reset to ${cyan(provider.defaultHost)}\n`);
+      return;
+    }
+    const host = normalizeHost(raw);
+    if (!host) fail(`Not a valid address: ${raw}\nExample: http://127.0.0.1:11434`);
+    cfg.hosts[providerId] = host;
+    saveConfig(cfg);
+    process.stdout.write(`${provider.label} host set to ${cyan(host)}\n`);
+    const env = resolveHost(providerId, cfg);
+    if (env.source?.startsWith("env var")) {
+      process.stdout.write(dim(`Note: ${env.source} is set and takes priority over this.\n`));
+    }
+    return;
+  }
+
   if (sub === "set-scope") {
     const scope = String(args[1] || "").toLowerCase();
     if (!SCOPES.includes(scope)) {
@@ -1503,7 +1766,7 @@ function cmdConfig(args) {
 
   fail(
     `Unknown config command: ${sub || "(none)"}\n` +
-      `Valid: set-key, set-provider, set-model, set-scope, set-history, show`
+      `Valid: set-key, set-provider, set-model, set-host, set-scope, set-history, show`
   );
 }
 
@@ -1521,6 +1784,7 @@ ${bold("Commands")}
   --history [clear]                       Show the current conversation, or reset it
   --extend [n]                            Add another ${HISTORY_DEFAULTS.block} exchanges of context
   --session                               Which thread this terminal maps to, and why
+  -rs, --reset-session                    Reset session settings (history, scope, budget)
   --config <sub> ...                      Manage saved config (see below)
   --help, -h                              Show this help
 
@@ -1533,6 +1797,7 @@ ${bold("Config")}
   tlme --config set-key <provider> <key>    Save an API key (chmod 600)
   tlme --config set-provider <provider>     Set the default provider
   tlme --config set-model <provider> <name> Set the default model for a provider
+  tlme --config set-host <url|default>      Where Ollama runs (default ${PROVIDERS.ollama.defaultHost})
   tlme --config set-scope <scope>           global | terminal | directory
   tlme --config set-history <n|on|off>      Exchanges per block, or turn it off
   tlme --config show                        Show providers, masked keys, models
@@ -1544,11 +1809,13 @@ ${bold("Context")}
 
   Scope decides what "the conversation" means — global (default) is one thread
   shared by every terminal; terminal gives each tab its own; directory keys it
-  to the project. Check yours with ${bold("tlme --session")}.
+  to the project. Check yours with ${bold("tlme --session")}; put scope, history and
+  budget back to defaults with ${bold("tlme -rs")} (the conversation is kept).
 
 ${bold("Examples")}
   tlme how do I create a nextjs app in this directory
   tlme -p openai explain this error briefly
+  tlme -p ollama -m llama3.2 what does chmod 600 do
   cat error.log | tlme why is this failing
   tlme --model claude-opus-4-8 refactor tips for a large react file
   tlme --setup
@@ -1561,6 +1828,8 @@ ${bold("Providers & keys")}
   grok         XAI_API_KEY                ${PROVIDERS.grok.keyHint}
   google       GEMINI_API_KEY             ${PROVIDERS.google.keyHint}
   openrouter   OPENROUTER_API_KEY         ${PROVIDERS.openrouter.keyHint}
+  ollama       (no key — local)           ${PROVIDERS.ollama.keyHint}
+               OLLAMA_HOST overrides the server address
 
 Keys resolve as: environment variable first, then ${CONFIG_PATH}.
 `;
@@ -1668,7 +1937,7 @@ async function main() {
   const bare = (word, allowed) =>
     cmd === word && tail.every((a) => allowed.includes(a.toLowerCase()) || /^[0-9]+$/.test(a));
 
-  const CONFIG_SUBS = ["set-key", "set-provider", "set-model", "set-scope", "set-history", "show"];
+  const CONFIG_SUBS = ["set-key", "set-provider", "set-model", "set-host", "set-scope", "set-history", "show"];
 
   if (cmd === "--config" || (cmd === "config" && CONFIG_SUBS.includes(String(tail[0] || "").toLowerCase()))) {
     cmdConfig(tail);
@@ -1689,6 +1958,16 @@ async function main() {
   }
   if (cmd === "--extend" || bare("extend", [])) {
     cmdExtend(tail);
+    return;
+  }
+  // `tlme -rs` resets the session settings; `tlme --session reset` is the
+  // spelled-out form. Plain `--session` still just reports.
+  const sessionReset =
+    (cmd === "--session" || cmd === "session") &&
+    tail.length === 1 &&
+    tail[0].toLowerCase() === "reset";
+  if (cmd === "-rs" || cmd === "--rs" || cmd === "--reset-session" || sessionReset) {
+    cmdResetSession();
     return;
   }
   if (cmd === "--session" || bare("session", [])) {
